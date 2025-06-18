@@ -22,54 +22,37 @@
 #include "cutlass/util/print_error.hpp"
 
 #include "cutlass/detail/layout.hpp"
+#include <cute/util/print.hpp>
 
 #include "smem_helper.hpp"
 #include "shared_storage.h"
 #include "smem_helper.hpp"
 
-template <class Element, class SmemFragmentTensor>
-CUTLASS_DEVICE void scaleTensor(Element scale,
-                                SmemFragmentTensor &smem_fragment) {
-
-  auto rmem_fragment = make_fragment_like(smem_fragment);
-  copy(smem_fragment, rmem_fragment);
-
-  auto data = rmem_fragment.data();
-  for (int i = 0; i < size(rmem_fragment); i++)
-    data[i] = scale * data[i];
-
-  copy(rmem_fragment, smem_fragment);
-}
-
 template <typename _TiledCopyS, typename _TiledCopyD, typename _GmemLayout,
-          typename _SmemLayout, typename _TileShape, typename _ThreadLayout>
-struct ScaleKernelParams {
+          typename _SmemLayout, typename _TileShape>
+struct Params {
   using TiledCopyS = _TiledCopyS;
   using TiledCopyD = _TiledCopyD;
   using GmemLayout = _GmemLayout;
   using SmemLayout = _SmemLayout;
   using TileShape = _TileShape;
-  using ThreadLayout = _ThreadLayout;
 
   TiledCopyS const tmaLoad;
   TiledCopyD const tmaStore;
   GmemLayout const gmemLayout;
   SmemLayout const smemLayout;
   TileShape const tileShape;
-  ThreadLayout const threadLayout;
 
-  ScaleKernelParams(_TiledCopyS const &tmaLoad, _TiledCopyD const &tmaStore,
-                    _GmemLayout const &gmemLayout,
-                    _SmemLayout const &smemLayout, _TileShape const &tileShape,
-                    _ThreadLayout const &threadLayout)
+  Params(_TiledCopyS const &tmaLoad, _TiledCopyD const &tmaStore,
+         _GmemLayout const &gmemLayout, _SmemLayout const &smemLayout,
+         _TileShape const &tileShape)
       : tmaLoad(tmaLoad), tmaStore(tmaStore), gmemLayout(gmemLayout),
-        smemLayout(smemLayout), tileShape(tileShape),
-        threadLayout(threadLayout) {}
+        smemLayout(smemLayout), tileShape(tileShape) {}
 };
 
 template <int kNumThreads, class Element, class Params>
 __global__ static void __launch_bounds__(kNumThreads, 1)
-    scaleTMAKernel(Element scale, CUTE_GRID_CONSTANT Params const params) {
+    copyTMAKernel(CUTE_GRID_CONSTANT Params const params) {
   using namespace cute;
 
   //
@@ -84,7 +67,6 @@ __global__ static void __launch_bounds__(kNumThreads, 1)
   auto &gmemLayout = params.gmemLayout;
   auto &smemLayout = params.smemLayout;
   auto &tileShape = params.tileShape;
-  auto &threadLayout = params.threadLayout;
 
   // Use Shared Storage structure to allocate aligned SMEM addresses.
   extern __shared__ char shared_memory[];
@@ -131,11 +113,20 @@ __global__ static void __launch_bounds__(kNumThreads, 1)
 
   mbarrier.wait(0 /* phase */);
 
-  auto tSsS = local_partition(sS, threadLayout, threadIdx.x);
-  scaleTensor(scale, tSsS);
-  
-  __syncthreads();
   cutlass::arch::fence_view_async_shared();
+
+  Element* sS_ptr = cute::raw_pointer_cast(sS.data());
+
+
+  // we have 32 threads every block, and the shm is every block is 128 * 128,
+  // so we use all threads to process a row(32 threads for 128 floats) in every for loop, and the for loop running 128 times
+  for(int row = 0; row < 128; row++){
+    int col = 4 * threadIdx.x;  //we assume that Element is float
+    float4 temp = reinterpret_cast<float4*>(sS_ptr + row * get<0>(sS.layout().stride()) + col)[0];
+    temp.x = temp.x + blockIdx.x;    temp.y = temp.y + blockIdx.x;    temp.z = temp.z + blockIdx.x;    temp.w = temp.w + blockIdx.x;
+    reinterpret_cast<float4*>(sS_ptr + row * get<0>(sS.layout().stride()) + col)[0] = temp;
+  }
+
 
   // Get CTA view of gmem out tensor
   auto mD = tmaStore.get_tma_tensor(shape(gmemLayout));
@@ -145,30 +136,25 @@ __global__ static void __launch_bounds__(kNumThreads, 1)
 
   if (warp_idx == 0 and lane_predicate) {
     cute::copy(tmaStore, cta_tmaD.partition_S(sS), cta_tmaD.partition_D(gD));
-    cute::tma_store_arrive();
+    // cute::tma_store_arrive();
   }
   // cute::tma_store_wait<0>();
 }
 
-template <int TILE_M = 128, int TILE_N = 128, int THREADS = 256>
-int scaleTmaKernelHost(int M, int N, int iterations = 1) {
+template <int TILE_M = 128, int TILE_N = 128, int THREADS = 32>
+int copy_host_tma_load_and_store_kernel(int M, int N, int iterations = 1) {
   using namespace cute;
+
+  printf("Copy with TMA load and store -- no swizzling.\n");
 
   using Element = float;
 
-  auto scale = Element(2.0f);
-
-  printf("Scale kernel with TMA load and store\n");
-
-  auto tensor_shape = make_shape(M, N);
-
   // Allocate and initialize
-  thrust::host_vector<Element> h_S(size(tensor_shape)); // (M, N)
-  thrust::host_vector<Element> h_D(size(tensor_shape)); // (M, N)
+  thrust::host_vector<Element> h_S(size(make_shape(M, 2*N))); // (M, N)
+  thrust::host_vector<Element> h_D(size(make_shape(M, N))); // (M, N)
 
-  for (size_t i = 0; i < h_S.size(); ++i) {
-    auto x = float(i) / 1000.0f;
-    h_S[i] = static_cast<Element>(x);
+  for (size_t i = 0; i < h_S.size(); ++i){
+    h_S[i] = static_cast<Element>(float(i));
   }
 
   thrust::device_vector<Element> d_S = h_S;
@@ -178,8 +164,8 @@ int scaleTmaKernelHost(int M, int N, int iterations = 1) {
   // Make tensors
   //
 
-  auto gmemLayoutS = make_layout(tensor_shape, LayoutRight{});
-  auto gmemLayoutD = make_layout(tensor_shape, LayoutRight{});
+  auto gmemLayoutS = make_layout(make_shape(M, 2*N), make_stride(2 * N, Int<1>{}));
+  auto gmemLayoutD = make_layout(make_shape(M, N), LayoutRight{});
   Tensor tensor_S = make_tensor(
       make_gmem_ptr(thrust::raw_pointer_cast(d_S.data())), gmemLayoutS);
   Tensor tensor_D = make_tensor(
@@ -190,20 +176,15 @@ int scaleTmaKernelHost(int M, int N, int iterations = 1) {
 
   auto tileShape = make_shape(bM{}, bN{});
   // NOTE: same smem layout for TMA load and store
-  auto smemLayout =
-      tile_to_shape(cfx::getSmemLayoutK<Element, TILE_N>(), tileShape);
+  auto smemLayout = make_layout(tileShape, LayoutRight{});
   auto tma_load =
-      make_tma_copy(SM90_TMA_LOAD{}, tensor_S, smemLayout, tileShape, Int<1>{});
-
+      make_tma_copy(SM90_TMA_LOAD{}, tensor_S, smemLayout);
   // print(tma_load);
-  auto tma_store = make_tma_copy(SM90_TMA_STORE{}, tensor_D, smemLayout,
-                                 tileShape, Int<1>{});
+
+  auto tma_store = make_tma_copy(SM90_TMA_STORE{}, tensor_D, smemLayout);
   // print(tma_store);
 
-  auto threadLayout = make_layout(Shape<_32, Int<ceil_div(THREADS, 32)>>{});
-
-  ScaleKernelParams params(tma_load, tma_store, gmemLayoutS, smemLayout,
-                           tileShape, threadLayout);
+  Params params(tma_load, tma_store, gmemLayoutS, smemLayout, tileShape);
 
   dim3 gridDim(ceil_div(M, TILE_M), ceil_div(N, TILE_N));
   dim3 blockDim(THREADS);
@@ -212,7 +193,7 @@ int scaleTmaKernelHost(int M, int N, int iterations = 1) {
   printf("smem size: %d.\n", smem_size);
 
   void const *kernel =
-      (void const *)scaleTMAKernel<THREADS, Element, decltype(params)>;
+      (void const *)copyTMAKernel<THREADS, Element, decltype(params)>;
   cfx::set_smem_size(smem_size, kernel);
 
   dim3 cluster_dims(1);
@@ -222,9 +203,9 @@ int scaleTmaKernelHost(int M, int N, int iterations = 1) {
                                              smem_size};
 
   for (int i = 0; i < iterations; i++) {
-    auto t1 = std::chrono::high_resolution_clock::now();
+    auto t1 = std::chrono::high_resolution_clock::now();    
     cutlass::Status status =
-        cutlass::launch_kernel_on_cluster(launch_params, kernel, scale, params);
+        cutlass::launch_kernel_on_cluster(launch_params, kernel, params);
     cudaError result = cudaDeviceSynchronize();
     auto t2 = std::chrono::high_resolution_clock::now();
     if (result != cudaSuccess) {
@@ -247,11 +228,24 @@ int scaleTmaKernelHost(int M, int N, int iterations = 1) {
 
   int good = 0, bad = 0;
 
-  for (size_t i = 0; i < h_D.size(); ++i) {
-    if (h_D[i] == scale * h_S[i])
-      good++;
-    else
-      bad++;
+  for (size_t x = 0; x < M; ++x) {
+    for (size_t y = 0; y < N; ++y) {
+        int linear_index_s = x * 2 * N + y;
+        h_S[linear_index_s] = h_S[linear_index_s] + int(x / 128); //int(x / 128) is euqal to blockIdx.x
+    
+    }
+  }
+
+  for(int x = 0; x < M; x++){
+    for(int y = 0; y < N; y++){
+        int linear_index_s = x * 2 * N + y;
+        int linear_index_d = x * N + y;
+        if (h_D[linear_index_d] == h_S[linear_index_s]){
+            good++;
+        }else{
+            bad++;
+        }
+    }
   }
 
   std::cout << "Success " << good << ", Fail " << bad << std::endl;

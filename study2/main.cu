@@ -1,5 +1,4 @@
 #include "cutlass/util/command_line.h"
-
 #include "tma_copy.h"
 
 int main(int argc, char const **argv) {
